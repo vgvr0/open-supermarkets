@@ -96,12 +96,12 @@ export const PROVIDERS: ProviderManifest[] = [
     id: 'ahorramas',
     label: 'AhorraMás',
     country: 'ES',
-    capabilities: ['search'],
-    auth: 'none',
+    capabilities: ['search', 'basket'],
+    auth: 'anonymous',
     tier: 'community',
     maintainer: 'vgvr0',
     credit:
-      'Salesforce Commerce Cloud storefront using anonymous server-rendered catalogue pages',
+      'Salesforce Commerce Cloud storefront using anonymous server-rendered catalogue and basket endpoints',
     load: async () => (await import('./ahorramas')).AhorramasProvider,
   },
 

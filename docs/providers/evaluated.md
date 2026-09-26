@@ -18,8 +18,22 @@ is a reason to re-probe, not a reason to stop.
 | Walmart | US | blocked | consumer GraphQL returns HTTP 418 (bot detection) |
 | Tesco Ireland | IE | needs work | not a header switch; xapi rejects with "Invalid Client" |
 | ~~Mercadona~~ | ES | **BUILT** | Algolia key found in the frontend bundle — see src/providers/mercadona.ts |
+| ~~Ahorramás~~ | ES | **BUILT** | Anonymous Salesforce Commerce Cloud search and basket — see src/providers/ahorramas.ts |
 | ~~Tesco Hungary~~ | HU | **BUILT** | same xapi as the UK, selected by `region: HU` — see src/providers/tesco-hu/ |
 | Tesco Czechia / Slovakia | CZ / SK | likely viable | same platform as Hungary; unverified, needs someone who can test |
+
+---
+
+## Ahorramás (Spain) — BUILT
+
+The provider uses the public Salesforce Commerce Cloud storefront over HTTP. Search
+and the anonymous basket work without a browser, login, postcode or store selection.
+A small in-memory session cookie jar is shared by the provider's search and basket
+requests; cookie values are not persisted or logged.
+
+Basket support covers add, read, absolute quantity updates, line removal and
+clear-by-removing-lines. Checkout and delivery slots are outside scope, and
+Salesforce Commerce Cloud may change internal controllers.
 
 ---
 

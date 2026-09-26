@@ -8,14 +8,42 @@
  * and is deliberately outside this first implementation.
  */
 
-import axios, { AxiosInstance } from 'axios';
-import type { GroceryProvider, Product, SearchOptions } from './types';
+import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
+import type { Basket, BasketItem, GroceryProvider, Product, SearchOptions } from './types';
 
 export const AHORRAMAS_BASE = 'https://www.ahorramas.com';
+export const AHORRAMAS_SITE = 'Sites-Ahorramas-Site';
+export const AHORRAMAS_LOCALE = 'es';
 const SEARCH_PATH = '/buscador';
 const GRID_PATH =
   '/on/demandware.store/Sites-Ahorramas-Site/es/Search-UpdateGrid';
+const STORE_PATH = `/on/demandware.store/${AHORRAMAS_SITE}/${AHORRAMAS_LOCALE}`;
 export const AHORRAMAS_PAGE_SIZE = 20;
+
+type HttpResponse = Pick<AxiosResponse, 'data' | 'headers' | 'status'>;
+
+export class AhorramasHttpError extends Error {
+  readonly status?: number;
+  readonly method: string;
+  readonly path: string;
+
+  constructor(method: string, path: string, status?: number, cause?: unknown) {
+    const detail = safeErrorDetail(cause);
+    super(`AhorraMás ${method} ${path} failed${status ? ` (HTTP ${status})` : ''}${detail ? `: ${detail}` : ''}`);
+    this.name = 'AhorramasHttpError';
+    this.status = status;
+    this.method = method;
+    this.path = path;
+    if (cause) (this as any).cause = cause;
+  }
+}
+
+export class AhorramasParseError extends Error {
+  constructor(message: string) {
+    super(`AhorraMás basket response could not be parsed: ${message}`);
+    this.name = 'AhorramasParseError';
+  }
+}
 
 interface HtmlNode {
   tag: string;
@@ -373,6 +401,117 @@ export function parseSearchPage(html: string): Product[] {
   return tiles.map((tile) => parseProductTile(tile, jsonLdProducts));
 }
 
+function safeErrorDetail(error: any): string {
+  const value = error?.response?.data;
+  const detail = typeof value === 'string'
+    ? value
+    : value?.error ?? value?.errorMessage ?? value?.message;
+  if (typeof detail !== 'string' || !detail.trim()) return '';
+  return detail
+    .replace(/((?:sid|dwsid|dwanonymous_[^=;\s]*|dwac_[^=;\s]*))=[^;\s]+/gi, '$1=[redacted]')
+    .slice(0, 240);
+}
+
+/** Parse Spanish/euro prices without changing the process locale. */
+export function parseAhorramasPrice(value: unknown): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const text = String(value ?? '').trim().replace(/\s/g, '').replace(/[€$£]/g, '');
+  if (!text) return 0;
+  const normalised = text.includes(',')
+    ? text.replace(/\./g, '').replace(',', '.')
+    : text;
+  const parsed = Number(normalised.replace(/[^\d.+-]/g, ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function basketNumber(value: unknown): number {
+  return typeof value === 'number'
+    ? (Number.isFinite(value) ? value : 0)
+    : parseAhorramasPrice(value);
+}
+
+function quantityTotal(value: unknown, items: BasketItem[]): number {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  if (value && typeof value === 'object') {
+    const values = Object.values(value as Record<string, unknown>).map(basketNumber);
+    if (values.length) return values.reduce((sum, quantity) => sum + quantity, 0);
+  }
+  return items.reduce((sum, item) => sum + item.quantity, 0);
+}
+
+function jsonCandidates(html: string): any[] {
+  const values: any[] = [];
+  const patterns = [
+    /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi,
+    /<script[^>]+type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi,
+  ];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(html))) {
+      try { values.push(JSON.parse(match[1])); } catch { /* unrelated page JSON */ }
+    }
+  }
+  return values;
+}
+
+/** Extract basket state from JSON, SSR JSON, or a JSON data attribute. */
+export function parseAhorramasCartHtml(html: string): any {
+  try {
+    const json = JSON.parse(html);
+    if (json && typeof json === 'object') return json;
+  } catch { /* /cart may return SSR HTML */ }
+
+  for (const candidate of jsonCandidates(html)) {
+    if (candidate?.cart || candidate?.basket || candidate?.items || candidate?.products) return candidate;
+    const nested = candidate?.data?.cart ?? candidate?.data?.basket;
+    if (nested) return { cart: nested };
+  }
+
+  const state = html.match(/(?:data-cart|data-basket|data-cart-state)=["']([^"']+)["']/i);
+  if (state) {
+    try { return JSON.parse(state[1].replace(/&quot;/g, '"')); } catch { /* malformed state */ }
+  }
+  throw new AhorramasParseError('no basket state was found in the SSR document');
+}
+
+export function normaliseAhorramasBasket(raw: any, provider = 'ahorramas'): Basket {
+  const cart = raw?.cart ?? raw?.basket ?? raw ?? {};
+  const sourceItems = Array.isArray(cart.items)
+    ? cart.items
+    : Array.isArray(cart.products) ? cart.products : [];
+  const items = sourceItems.map((item: any): BasketItem => {
+    const product = item?.product ?? item;
+    const quantity = basketNumber(item?.quantity ?? item?.qty ?? 1);
+    const unit = item?.unitPrice?.sales?.value
+      ?? item?.unitPrice?.value
+      ?? item?.unitPrice
+      ?? item?.price?.sales?.value
+      ?? item?.price;
+    const total = item?.priceTotal?.decimalPrice
+      ?? item?.priceTotal?.value
+      ?? item?.totalPrice
+      ?? item?.subtotal
+      ?? item?.price?.sales?.value;
+    return {
+      item_id: String(item?.UUID ?? item?.uuid ?? item?.item_id ?? item?.itemId ?? ''),
+      product_uid: String(item?.id ?? item?.productId ?? product?.id ?? product?.productId ?? ''),
+      name: String(item?.productName ?? product?.productName ?? product?.name ?? 'Unknown item'),
+      quantity,
+      unit_price: basketNumber(unit),
+      total_price: total === undefined ? basketNumber(unit) * quantity : basketNumber(total),
+    };
+  });
+  const totals = cart.totals ?? raw?.totals ?? {};
+  const total = totals.total ?? totals.grandTotal ?? totals.orderTotal ?? totals.totalPrice;
+  return {
+    items,
+    total_quantity: quantityTotal(cart.quantityTotal ?? cart.quantityTotalByUnit, items),
+    total_cost: total === undefined ? basketNumber(totals.subTotal ?? totals.subtotal) : basketNumber(total),
+    provider,
+    currency: 'EUR',
+  };
+}
+
 function errorMessage(error: unknown, action: string): Error {
   if (axios.isAxiosError(error)) {
     const status = error.response?.status;
@@ -387,13 +526,51 @@ export class AhorramasProvider implements GroceryProvider {
   readonly name = 'ahorramas';
 
   private readonly http: AxiosInstance;
+  private readonly cookies = new Map<string, string>();
 
-  constructor() {
-    this.http = axios.create({
+  constructor(http?: AxiosInstance) {
+    this.http = http ?? axios.create({
       baseURL: AHORRAMAS_BASE,
       timeout: 15_000,
-      headers: { Accept: 'text/html' },
+      headers: { Accept: 'text/html, application/json' },
     });
+  }
+
+  private captureCookies(headers: any): void {
+    const values = headers?.['set-cookie'] ?? headers?.['Set-Cookie'];
+    for (const raw of Array.isArray(values) ? values : values ? [values] : []) {
+      const pair = String(raw).split(';', 1)[0];
+      const separator = pair.indexOf('=');
+      if (separator < 1) continue;
+      const name = pair.slice(0, separator).trim();
+      const value = pair.slice(separator + 1).trim();
+      if (/Max-Age=0|Expires=Thu, 01 Jan 1970/i.test(raw)) this.cookies.delete(name);
+      else this.cookies.set(name, value);
+    }
+  }
+
+  private cookieHeader(): string {
+    return [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; ');
+  }
+
+  private async request<T = any>(config: AxiosRequestConfig): Promise<HttpResponse & { data: T }> {
+    const cookie = this.cookieHeader();
+    const headers = {
+      ...(config.headers as any),
+      ...(cookie ? { Cookie: cookie } : {}),
+    };
+    try {
+      const response = await this.http.request<T>({ ...config, headers });
+      this.captureCookies(response.headers);
+      return response as HttpResponse & { data: T };
+    } catch (error: any) {
+      throw new AhorramasHttpError(
+        String(config.method ?? 'GET').toUpperCase(),
+        String(config.url),
+        error?.response?.status,
+        error,
+      );
+    }
   }
 
   private async fetchPage(query: string, start: number): Promise<Product[]> {
@@ -408,6 +585,7 @@ export class AhorramasProvider implements GroceryProvider {
       if (typeof response.data !== 'string') {
         throw new Error('AhorraMás returned a non-HTML response');
       }
+      this.captureCookies(response.headers);
       return parseSearchPage(response.data);
     } catch (error) {
       throw errorMessage(error, 'search');
@@ -448,5 +626,71 @@ export class AhorramasProvider implements GroceryProvider {
     }
 
     return results.slice(0, limit);
+  }
+
+  async getBasket(): Promise<Basket> {
+    const response = await this.request<any>({ method: 'GET', url: '/cart' });
+    const raw = typeof response.data === 'string'
+      ? parseAhorramasCartHtml(response.data)
+      : response.data;
+    return normaliseAhorramasBasket(raw, this.name);
+  }
+
+  private async findBasketItem(itemId: string): Promise<BasketItem> {
+    const basket = await this.getBasket();
+    const item = basket.items.find((candidate) =>
+      candidate.item_id === itemId || candidate.product_uid === itemId
+    );
+    if (!item) throw new Error(`AhorraMás basket line ${itemId} not found`);
+    return item;
+  }
+
+  private validateQuantity(quantity: number): void {
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error('AhorraMás: quantity must be greater than zero');
+    }
+  }
+
+  async addToBasket(productId: string, quantity: number): Promise<void> {
+    this.validateQuantity(quantity);
+    await this.request({
+      method: 'POST',
+      url: `${STORE_PATH}/Cart-AddProduct`,
+      data: new URLSearchParams({
+        pid: productId,
+        quantity: String(quantity),
+        childProducts: '[]',
+      }),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+  }
+
+  async updateBasketItem(itemId: string, quantity: number): Promise<void> {
+    this.validateQuantity(quantity);
+    const item = await this.findBasketItem(itemId);
+    await this.request({
+      method: 'GET',
+      url: `${STORE_PATH}/Cart-UpdateQuantity`,
+      params: {
+        pid: item.product_uid,
+        quantity,
+        quantityAbs: quantity,
+        uuid: item.item_id,
+      },
+    });
+  }
+
+  async removeFromBasket(itemId: string): Promise<void> {
+    const item = await this.findBasketItem(itemId);
+    await this.request({
+      method: 'GET',
+      url: `${STORE_PATH}/Cart-RemoveProductLineItem`,
+      params: { pid: item.product_uid, uuid: item.item_id },
+    });
+  }
+
+  async clearBasket(): Promise<void> {
+    const basket = await this.getBasket();
+    for (const item of basket.items) await this.removeFromBasket(item.item_id);
   }
 }
